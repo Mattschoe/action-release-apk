@@ -1,0 +1,108 @@
+name: 'Android Release APK'
+description: 'Builds an Android APK with Gradle and attaches it (plus optional docs) to the triggering GitHub Release.'
+branding:
+  icon: 'package'
+  color: 'green'
+
+inputs:
+  java-version:
+    description: 'JDK version to build with.'
+    required: false
+    default: '21'
+  gradle-task:
+    description: 'Gradle task that produces the release APK.'
+    required: false
+    default: 'assembleRelease'
+  apk-path:
+    description: 'Path/glob of the built APK to attach to the release.'
+    required: false
+    default: 'app/build/outputs/apk/release/app-release.apk'
+  keystore-path:
+    description: 'Where to write the decoded keystore (must match build.gradle.kts).'
+    required: false
+    default: 'app/keystore.jks'
+  docs-task:
+    description: 'Optional extra Gradle task to generate docs (e.g. dokkaGenerate).'
+    required: false
+    default: ''
+  docs-dir:
+    description: 'Optional directory to zip into documentation.zip and attach.'
+    required: false
+    default: ''
+  keystore-base64:
+    description: 'Base64-encoded release keystore. Omit to build unsigned.'
+    required: false
+    default: ''
+  keystore-password:
+    description: 'Keystore password.'
+    required: false
+    default: ''
+  key-alias:
+    description: 'Key alias.'
+    required: false
+    default: ''
+  key-password:
+    description: 'Key password.'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup JDK
+      uses: actions/setup-java@v4
+      with:
+        java-version: ${{ inputs.java-version }}
+        distribution: 'temurin'
+        cache: gradle
+
+    - name: Extract version from release tag
+      shell: bash
+      run: echo "VERSION_NAME=${TAG#v}" >> "$GITHUB_ENV"
+      env:
+        TAG: ${{ github.event.release.tag_name }}
+
+    - name: Decode keystore
+      shell: bash
+      env:
+        ENCODED_STRING: ${{ inputs.keystore-base64 }}
+        KEYSTORE_PATH: ${{ inputs.keystore-path }}
+      run: |
+        if [ -n "$ENCODED_STRING" ]; then
+          mkdir -p "$(dirname "$KEYSTORE_PATH")"
+          echo "$ENCODED_STRING" | base64 -di > "$KEYSTORE_PATH"
+        else
+          echo "No keystore-base64 provided — building unsigned."
+        fi
+
+    - name: Build APK
+      shell: bash
+      env:
+        KEYSTORE_PASSWORD: ${{ inputs.keystore-password }}
+        KEY_ALIAS: ${{ inputs.key-alias }}
+        KEY_PASSWORD: ${{ inputs.key-password }}
+      run: ./gradlew ${{ inputs.gradle-task }} ${{ inputs.docs-task }}
+
+    - name: Zip documentation
+      if: ${{ inputs.docs-dir != '' }}
+      shell: bash
+      run: zip -r documentation.zip "${{ inputs.docs-dir }}"
+
+    - name: Assemble artifact list
+      id: artifacts
+      shell: bash
+      run: |
+        {
+          echo "files<<EOF"
+          echo "${{ inputs.apk-path }}"
+          if [ -n "${{ inputs.docs-dir }}" ]; then echo "documentation.zip"; fi
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Attach to release
+      uses: softprops/action-gh-release@v2
+      with:
+        token: ${{ github.token }}
+        files: ${{ steps.artifacts.outputs.files }}
