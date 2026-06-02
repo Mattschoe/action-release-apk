@@ -28,7 +28,7 @@ jobs:
 ```
 
 Cut a GitHub Release (e.g. via release-please or manually) and the APK is attached as an
-asset, ready to download and install on a phone. Omit the signing inputs (`keystore-*`and `key-*) to build an unsigned APK (no secrets required).
+asset, ready to download and install on a phone. Omit the signing inputs (`keystore-*`and `key-*`) to build an unsigned APK (no secrets required).
 
 ## Inputs
 
