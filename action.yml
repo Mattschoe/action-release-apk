@@ -1,26 +1,26 @@
-name: 'Android Release APK'
-description: 'Builds an Android APK with Gradle and attaches it (plus optional docs) to the triggering GitHub Release.'
+name: 'KMP Release Artifacts'
+description: 'Builds Android and Desktop artifacts with Gradle and attaches them (plus optional docs) to the triggering GitHub Release.'
 branding:
   icon: 'package'
   color: 'green'
 
 inputs:
+  target:
+    description: "What to build: 'android' or 'desktop'."
+    required: false
+    default: 'android'
   java-version:
     description: 'JDK version to build with.'
     required: false
     default: '21'
   gradle-task:
-    description: 'Gradle task that produces the release APK.'
+    description: 'Gradle task that produces the release artifact. Defaults per target when empty.'
     required: false
-    default: 'assembleRelease'
-  apk-path:
-    description: 'Path/glob of the built APK to attach to the release.'
+    default: ''
+  artifact-path:
+    description: 'Path/glob of the built artifact(s) to attach, one per line. Defaults per target when empty.'
     required: false
-    default: 'app/build/outputs/apk/release/app-release.apk'
-  keystore-path:
-    description: 'Where to write the decoded keystore (must match build.gradle.kts).'
-    required: false
-    default: 'app/keystore.jks'
+    default: ''
   docs-task:
     description: 'Optional extra Gradle task to generate docs (e.g. dokkaGenerate).'
     required: false
@@ -29,26 +29,54 @@ inputs:
     description: 'Optional directory to zip into documentation.zip and attach.'
     required: false
     default: ''
-  keystore-base64:
+
+  android-keystore-path:
+    description: 'Where to write the decoded keystore (must match build.gradle.kts).'
+    required: false
+    default: 'app/keystore.jks'
+  android-keystore-base64:
     description: 'Base64-encoded release keystore. Omit to build unsigned.'
     required: false
     default: ''
-  keystore-password:
+  android-keystore-password:
     description: 'Keystore password.'
     required: false
     default: ''
-  key-alias:
+  android-key-alias:
     description: 'Key alias.'
     required: false
     default: ''
-  key-password:
+  android-key-password:
     description: 'Key password.'
     required: false
     default: ''
 
+  desktop-module:
+    description: 'Gradle module holding the Compose Desktop application, used to build the default artifact-path.'
+    required: false
+    default: 'composeApp'
+
 runs:
   using: 'composite'
   steps:
+    - name: Validate target
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+      run: |
+        case "$TARGET" in
+          android|desktop)
+            ;;
+          ios)
+            echo "::error::target 'ios' is not supported. See https://github.com/Mattschoe/action-release-apk/issues/2"
+            exit 1
+            ;;
+          *)
+            echo "::error::Unknown target '$TARGET'. Expected 'android' or 'desktop'."
+            exit 1
+            ;;
+        esac
+
     - uses: actions/checkout@v4
 
     - name: Setup JDK
@@ -58,6 +86,59 @@ runs:
         distribution: 'temurin'
         cache: gradle
 
+    # gradle-task and artifact-path can only carry one default each in the input
+    # block, so the per-target ones are filled in here when the caller left them
+    # empty. Everything downstream reads the resolved env vars, never the inputs.
+    - name: Resolve target defaults
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        GRADLE_TASK_INPUT: ${{ inputs.gradle-task }}
+        ARTIFACT_PATH_INPUT: ${{ inputs.artifact-path }}
+        DESKTOP_MODULE: ${{ inputs.desktop-module }}
+      run: |
+        gradle_task="$GRADLE_TASK_INPUT"
+        artifact_path="$ARTIFACT_PATH_INPUT"
+
+        if [ -z "$gradle_task" ]; then
+          case "$TARGET" in
+            android) gradle_task='assembleRelease' ;;
+            desktop) gradle_task='packageReleaseDistributionForCurrentOS' ;;
+          esac
+        fi
+
+        if [ -z "$artifact_path" ]; then
+          case "$TARGET" in
+            android)
+              artifact_path='app/build/outputs/apk/release/app-release.apk'
+              ;;
+            desktop)
+              # Every jpackage format, so one default covers all three runner
+              # OSes. Only the current OS's formats exist on any given run; the
+              # rest simply match nothing.
+              base="$DESKTOP_MODULE/build/compose/binaries/main-release"
+              artifact_path="$(printf '%s\n' \
+                "$base/dmg/*.dmg" \
+                "$base/pkg/*.pkg" \
+                "$base/msi/*.msi" \
+                "$base/exe/*.exe" \
+                "$base/deb/*.deb" \
+                "$base/rpm/*.rpm")"
+              ;;
+          esac
+        fi
+
+        echo "Gradle task:   $gradle_task"
+        echo "Artifact path:"
+        printf '  %s\n' "$artifact_path"
+
+        echo "GRADLE_TASK=$gradle_task" >> "$GITHUB_ENV"
+        {
+          echo "ARTIFACT_PATH<<__ARTIFACT_PATH_EOF__"
+          printf '%s\n' "$artifact_path"
+          echo "__ARTIFACT_PATH_EOF__"
+        } >> "$GITHUB_ENV"
+
     - name: Extract version from release tag
       shell: bash
       run: echo "VERSION_NAME=${TAG#v}" >> "$GITHUB_ENV"
@@ -65,40 +146,97 @@ runs:
         TAG: ${{ github.event.release.tag_name }}
 
     - name: Decode keystore
+      if: ${{ inputs.target == 'android' }}
       shell: bash
       env:
-        ENCODED_STRING: ${{ inputs.keystore-base64 }}
-        KEYSTORE_PATH: ${{ inputs.keystore-path }}
+        ENCODED_STRING: ${{ inputs.android-keystore-base64 }}
+        KEYSTORE_PATH: ${{ inputs.android-keystore-path }}
       run: |
         if [ -n "$ENCODED_STRING" ]; then
           mkdir -p "$(dirname "$KEYSTORE_PATH")"
           echo "$ENCODED_STRING" | base64 -di > "$KEYSTORE_PATH"
         else
-          echo "No keystore-base64 provided — building unsigned."
+          echo "No android-keystore-base64 provided — building unsigned."
         fi
 
-    - name: Build APK
+    - name: Build
       shell: bash
       env:
-        KEYSTORE_PASSWORD: ${{ inputs.keystore-password }}
-        KEY_ALIAS: ${{ inputs.key-alias }}
-        KEY_PASSWORD: ${{ inputs.key-password }}
-      run: ./gradlew ${{ inputs.gradle-task }} ${{ inputs.docs-task }}
+        KEYSTORE_PASSWORD: ${{ inputs.android-keystore-password }}
+        KEY_ALIAS: ${{ inputs.android-key-alias }}
+        KEY_PASSWORD: ${{ inputs.android-key-password }}
+      run: |
+        # Unquoted on purpose: callers may pass several space-separated tasks.
+        # shellcheck disable=SC2086
+        ./gradlew $GRADLE_TASK
+
+    - name: Generate documentation
+      if: ${{ inputs.docs-task != '' }}
+      shell: bash
+      env:
+        DOCS_TASK: ${{ inputs.docs-task }}
+      run: |
+        # shellcheck disable=SC2086
+        ./gradlew $DOCS_TASK
 
     - name: Zip documentation
       if: ${{ inputs.docs-dir != '' }}
       shell: bash
-      run: zip -r documentation.zip "${{ inputs.docs-dir }}"
+      env:
+        DOCS_DIR: ${{ inputs.docs-dir }}
+      run: |
+        # zip is not installed on Windows runners; 7z is present on all three.
+        if command -v zip >/dev/null 2>&1; then
+          zip -r documentation.zip "$DOCS_DIR"
+        elif command -v 7z >/dev/null 2>&1; then
+          7z a documentation.zip "$DOCS_DIR"
+        else
+          echo "::error::Neither zip nor 7z is available to package '$DOCS_DIR'."
+          exit 1
+        fi
 
+    # Globs are expanded here rather than left to action-gh-release, so that the
+    # files we verified are exactly the files that get uploaded — and so a
+    # mismatch between artifact-path and what Gradle actually produced fails the
+    # job instead of publishing an empty release.
     - name: Assemble artifact list
       id: artifacts
       shell: bash
+      env:
+        DOCS_DIR: ${{ inputs.docs-dir }}
       run: |
+        shopt -s globstar
+
+        patterns=()
+        while IFS= read -r pattern; do
+          [ -n "$pattern" ] || continue
+          patterns+=("$pattern")
+        done <<< "$ARTIFACT_PATH"
+
+        files=()
+        for pattern in "${patterns[@]}"; do
+          mapfile -t matches < <(compgen -G "$pattern" || true)
+          echo "${#matches[@]} match(es) for $pattern"
+          files+=("${matches[@]}")
+        done
+
+        if [ ${#files[@]} -eq 0 ]; then
+          echo "::error::No files matched artifact-path — nothing would be attached to the release."
+          echo "Patterns tried:"
+          printf '  %s\n' "${patterns[@]}"
+          echo "Check the 'artifact-path' input. For target 'desktop', also check that"
+          echo "build.gradle.kts declares nativeDistributions targetFormats for $RUNNER_OS."
+          exit 1
+        fi
+
+        if [ -n "$DOCS_DIR" ]; then
+          files+=(documentation.zip)
+        fi
+
         {
-          echo "files<<EOF"
-          echo "${{ inputs.apk-path }}"
-          if [ -n "${{ inputs.docs-dir }}" ]; then echo "documentation.zip"; fi
-          echo "EOF"
+          echo "files<<__FILES_EOF__"
+          printf '%s\n' "${files[@]}"
+          echo "__FILES_EOF__"
         } >> "$GITHUB_OUTPUT"
 
     - name: Attach to release
