@@ -5,6 +5,13 @@ branding:
   color: 'green'
 
 inputs:
+  working-directory:
+    description: >-
+      Folder containing the Gradle project (the one with gradlew), relative to the repo root.
+      Leave empty to auto-detect: the repo root is used if it has gradlew, otherwise the action
+      searches subfolders and uses the single match. All other path inputs are relative to this folder.
+    required: false
+    default: ''
   java-version:
     description: 'JDK version to build with.'
     required: false
@@ -14,11 +21,13 @@ inputs:
     required: false
     default: 'assembleRelease'
   apk-path:
-    description: 'Path/glob of the built APK to attach to the release.'
+    description: >-
+      Path or glob of the APK(s) to attach, relative to the Gradle project folder. Leave empty to
+      find the single APK under any module's build/outputs/apk/release/.
     required: false
-    default: 'app/build/outputs/apk/release/app-release.apk'
+    default: ''
   keystore-path:
-    description: 'Where to write the decoded keystore (must match build.gradle.kts).'
+    description: 'Where to write the decoded keystore, relative to the Gradle project folder (must match build.gradle.kts).'
     required: false
     default: 'app/keystore.jks'
   docs-task:
@@ -26,7 +35,7 @@ inputs:
     required: false
     default: ''
   docs-dir:
-    description: 'Optional directory to zip into documentation.zip and attach.'
+    description: 'Optional directory, relative to the Gradle project folder, to zip into documentation.zip and attach.'
     required: false
     default: ''
   keystore-base64:
@@ -46,10 +55,52 @@ inputs:
     required: false
     default: ''
 
+outputs:
+  project-dir:
+    description: 'Absolute path of the Gradle project folder that was built.'
+    value: ${{ steps.project.outputs.dir }}
+
 runs:
   using: 'composite'
   steps:
     - uses: actions/checkout@v4
+
+    - name: Resolve Gradle project folder
+      id: project
+      shell: bash
+      env:
+        INPUT_DIR: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        if [ -n "$INPUT_DIR" ]; then
+          dir="$INPUT_DIR"
+          if [ ! -f "$dir/gradlew" ]; then
+            echo "::error::working-directory '$INPUT_DIR' has no gradlew."
+            exit 1
+          fi
+        elif [ -f gradlew ]; then
+          dir=.
+        else
+          found=()
+          while IFS= read -r -d '' wrapper; do
+            found+=("$(dirname "$wrapper")")
+          done < <(find . -mindepth 2 -maxdepth 4 \
+            \( -name .git -o -name build -o -name .gradle -o -name node_modules \) -prune \
+            -o -type f -name gradlew -print0)
+          if [ "${#found[@]}" -eq 0 ]; then
+            echo "::error::No gradlew found in the repo root or its subfolders (4 levels deep). Set working-directory."
+            exit 1
+          fi
+          if [ "${#found[@]}" -gt 1 ]; then
+            echo "::error::Found several Gradle projects: ${found[*]}. Set working-directory to pick one."
+            exit 1
+          fi
+          dir="${found[0]}"
+        fi
+        abs="$(cd "$dir" && pwd)"
+        rel="${abs#"$GITHUB_WORKSPACE"}"
+        echo "Using Gradle project at ./${rel#/}"
+        echo "dir=$abs" >> "$GITHUB_OUTPUT"
 
     - name: Setup JDK
       uses: actions/setup-java@v4
@@ -66,10 +117,12 @@ runs:
 
     - name: Decode keystore
       shell: bash
+      working-directory: ${{ steps.project.outputs.dir }}
       env:
         ENCODED_STRING: ${{ inputs.keystore-base64 }}
         KEYSTORE_PATH: ${{ inputs.keystore-path }}
       run: |
+        set -euo pipefail
         if [ -n "$ENCODED_STRING" ]; then
           mkdir -p "$(dirname "$KEYSTORE_PATH")"
           echo "$ENCODED_STRING" | base64 -di > "$KEYSTORE_PATH"
@@ -79,30 +132,74 @@ runs:
 
     - name: Build APK
       shell: bash
+      working-directory: ${{ steps.project.outputs.dir }}
       env:
+        GRADLE_TASK: ${{ inputs.gradle-task }}
+        DOCS_TASK: ${{ inputs.docs-task }}
         KEYSTORE_PASSWORD: ${{ inputs.keystore-password }}
         KEY_ALIAS: ${{ inputs.key-alias }}
         KEY_PASSWORD: ${{ inputs.key-password }}
-      run: ./gradlew ${{ inputs.gradle-task }} ${{ inputs.docs-task }}
+      run: |
+        set -euo pipefail
+        read -ra tasks <<< "$GRADLE_TASK $DOCS_TASK"
+        ./gradlew "${tasks[@]}"
 
     - name: Zip documentation
       if: ${{ inputs.docs-dir != '' }}
       shell: bash
-      run: zip -r documentation.zip "${{ inputs.docs-dir }}"
+      working-directory: ${{ steps.project.outputs.dir }}
+      env:
+        DOCS_DIR: ${{ inputs.docs-dir }}
+      run: |
+        set -euo pipefail
+        if [ ! -d "$DOCS_DIR" ]; then
+          echo "::error::docs-dir '$DOCS_DIR' does not exist after the build."
+          exit 1
+        fi
+        zip -r "$RUNNER_TEMP/documentation.zip" "$DOCS_DIR"
 
     - name: Assemble artifact list
       id: artifacts
       shell: bash
+      working-directory: ${{ steps.project.outputs.dir }}
+      env:
+        APK_PATH: ${{ inputs.apk-path }}
+        DOCS_DIR: ${{ inputs.docs-dir }}
       run: |
+        set -euo pipefail
+        shopt -s globstar nullglob
+        pattern="${APK_PATH:-**/build/outputs/apk/release/*.apk}"
+
+        # Split on newlines only, so paths with spaces still work; globs expand here.
+        IFS=$'\n'
+        candidates=($pattern)
+        unset IFS
+        apks=()
+        for f in "${candidates[@]}"; do
+          if [ -f "$f" ]; then apks+=("$PWD/$f"); fi
+        done
+
+        if [ "${#apks[@]}" -eq 0 ]; then
+          echo "::error::No APK matched '$pattern' in $PWD."
+          exit 1
+        fi
+        if [ -z "$APK_PATH" ] && [ "${#apks[@]}" -gt 1 ]; then
+          echo "::error::Found several APKs: ${apks[*]}. Set apk-path to pick one."
+          exit 1
+        fi
+
+        delimiter="EOF_$(openssl rand -hex 8)"
         {
-          echo "files<<EOF"
-          echo "${{ inputs.apk-path }}"
-          if [ -n "${{ inputs.docs-dir }}" ]; then echo "documentation.zip"; fi
-          echo "EOF"
+          echo "files<<$delimiter"
+          printf '%s\n' "${apks[@]}"
+          if [ -n "$DOCS_DIR" ]; then echo "$RUNNER_TEMP/documentation.zip"; fi
+          echo "$delimiter"
         } >> "$GITHUB_OUTPUT"
+        printf 'Attaching %s\n' "${apks[@]}"
 
     - name: Attach to release
       uses: softprops/action-gh-release@v2
       with:
         token: ${{ github.token }}
         files: ${{ steps.artifacts.outputs.files }}
+        fail_on_unmatched_files: true
